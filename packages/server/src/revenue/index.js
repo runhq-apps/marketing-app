@@ -237,25 +237,27 @@ export function recordPayments(project, source, rows) {
       if (!row?.external_id || !row.occurred_at) continue;
 
       // A refund carries no customer of its own — it inherits the charge's identity.
-      let { email, name, customer_ref } = row;
+      let { email, name, customer_ref, user_ref } = row;
       if (row.kind === 'refund' && row.charge_ref) {
         const parent = get('SELECT * FROM payments WHERE source_id = :s AND external_id = :e',
           { s: source.id, e: row.charge_ref });
         email = email ?? parent?.email ?? null;
         name = name ?? parent?.name ?? null;
         customer_ref = customer_ref ?? parent?.customer_ref ?? null;
+        user_ref = user_ref ?? parent?.user_ref ?? null;
       }
 
-      const lead = matchLead(project, { email, name, customer_ref, occurred_at: row.occurred_at, createMissing });
+      const lead = matchLead(project, { email, name, customer_ref, user_ref, occurred_at: row.occurred_at, createMissing });
       if (lead) { matched++; touchedLeads.add(lead.id); } else unmatched++;
 
-      run(`INSERT INTO payments (id, project_id, source_id, external_id, kind, customer_ref, email, name,
+      run(`INSERT INTO payments (id, project_id, source_id, external_id, kind, customer_ref, user_ref, email, name,
              lead_id, amount, currency, description, invoice_ref, subscription_ref, status, livemode,
              occurred_at, synced_at)
-           VALUES (:id, :p, :s, :ext, :kind, :cust, :email, :name, :lead, :amount, :cur, :desc,
+           VALUES (:id, :p, :s, :ext, :kind, :cust, :user, :email, :name, :lead, :amount, :cur, :desc,
              :inv, :sub, :status, :live, :at, :synced)
            ON CONFLICT(source_id, external_id) DO UPDATE SET
              kind = excluded.kind, customer_ref = COALESCE(excluded.customer_ref, payments.customer_ref),
+             user_ref = COALESCE(excluded.user_ref, payments.user_ref),
              email = COALESCE(excluded.email, payments.email), name = COALESCE(excluded.name, payments.name),
              lead_id = COALESCE(excluded.lead_id, payments.lead_id),
              amount = excluded.amount, currency = excluded.currency,
@@ -264,14 +266,15 @@ export function recordPayments(project, source, rows) {
              subscription_ref = COALESCE(excluded.subscription_ref, payments.subscription_ref),
              status = excluded.status, occurred_at = excluded.occurred_at, synced_at = excluded.synced_at`, {
         id: uid(), p: project.id, s: source.id, ext: row.external_id, kind: row.kind ?? 'payment',
-        cust: customer_ref ?? null, email: email ?? null, name: name ?? null, lead: lead?.id ?? null,
+        cust: customer_ref ?? null, user: user_ref ?? null, email: email ?? null, name: name ?? null,
+        lead: lead?.id ?? null,
         amount: Number(row.amount ?? 0), cur: row.currency ?? project.currency,
         desc: row.description ?? null, inv: row.invoice_ref ?? null, sub: row.subscription_ref ?? null,
         status: row.status ?? null, live: row.livemode === false ? 0 : 1,
         at: row.occurred_at, synced: now(),
       });
 
-      writeRevenueEvent(project, source, { ...row, email, lead_id: lead?.id ?? null }, conversionKey);
+      writeRevenueEvent(project, source, { ...row, email, user_ref, lead_id: lead?.id ?? null }, conversionKey);
       if (lead && row.kind !== 'refund' && conversionKey) promoteToCustomer(lead, conversionKey, stages, row.occurred_at);
       written++;
     }
@@ -303,6 +306,7 @@ function writeRevenueEvent(project, source, row, conversionKey) {
       ...(row.invoice_ref ? { invoice: row.invoice_ref } : {}),
       ...(row.subscription_ref ? { subscription: row.subscription_ref } : {}),
       ...(row.customer_ref ? { customer: row.customer_ref } : {}),
+      ...(row.user_ref ? { user: row.user_ref } : {}),
     }),
     ts: row.occurred_at, key: dedupeKey(source.id, row.external_id),
   });
@@ -311,33 +315,38 @@ function writeRevenueEvent(project, source, row, conversionKey) {
 /**
  * Who paid?
  *
- *   1. the email on the payment, which is how a tracked lead who later pays is found
- *   2. the processor's customer id, for products that pass it to runhq.identify()
- *   3. nobody yet — so the payer becomes a lead with no channel
+ *   1. a user id the product stamped onto the payment itself, matched against the id it
+ *      passed to runhq.identify(). The product asserting who paid beats anything typed
+ *      into a card form, and it is the only join that works at all for a product whose
+ *      sign-in never yields an email — a social login, a wallet, a game handle.
+ *   2. the email on the payment, which is how a tracked lead who later pays is found
+ *   3. the processor's customer id, for products that pass that to runhq.identify()
+ *   4. nobody yet — so the payer becomes a lead with no channel
  *
- * Step 3 matters: a customer whose first touch was never tracked is a real hole in the
+ * Step 4 matters: a customer whose first touch was never tracked is a real hole in the
  * attribution, and the honest place to show it is the Unattributed row, not nowhere.
  */
-export function matchLead(project, { email, name, customer_ref, occurred_at, createMissing = true }) {
+export function matchLead(project, { email, name, customer_ref, user_ref, occurred_at, createMissing = true }) {
   const normalised = email ? String(email).trim().toLowerCase() : null;
+  const byExternalId = (ref) => (ref
+    ? get('SELECT * FROM leads WHERE project_id = :p AND external_id = :x', { p: project.id, x: ref })
+    : null);
+  const byEmail = () => (normalised
+    ? get('SELECT * FROM leads WHERE project_id = :p AND email = :e', { p: project.id, e: normalised })
+    : null);
 
-  if (normalised) {
-    const byEmail = get('SELECT * FROM leads WHERE project_id = :p AND email = :e', { p: project.id, e: normalised });
-    if (byEmail) return byEmail;
-  }
-  if (customer_ref) {
-    const byCustomer = get('SELECT * FROM leads WHERE project_id = :p AND external_id = :x',
-      { p: project.id, x: customer_ref });
-    if (byCustomer) return byCustomer;
-  }
-  if (!createMissing || (!normalised && !customer_ref)) return null;
+  const found = byExternalId(user_ref) ?? byEmail() ?? byExternalId(customer_ref);
+  if (found) return found;
+  if (!createMissing || (!normalised && !customer_ref && !user_ref)) return null;
 
   const id = uid();
   const ts = occurred_at ?? now();
   run(`INSERT INTO leads (id, project_id, email, name, external_id, stage, value, status, first_seen, last_seen)
        VALUES (:id, :p, :email, :name, :ext, 'visit', 0, 'open', :ts, :ts)`, {
     id, p: project.id, email: normalised, name: name ?? null,
-    ext: normalised ? null : customer_ref, ts,
+    // A stamped user id is worth keeping on the new lead whatever else is known: it is
+    // what a later identify() call from the product will meet this record on.
+    ext: user_ref ?? (normalised ? null : customer_ref), ts,
   });
   return get('SELECT * FROM leads WHERE id = :id', { id });
 }
@@ -376,7 +385,7 @@ export function recordSubscriptions(project, source, rows) {
     for (const row of rows) {
       if (!row?.external_id) continue;
       const lead = matchLead(project, {
-        email: row.email, customer_ref: row.customer_ref,
+        email: row.email, customer_ref: row.customer_ref, user_ref: row.user_ref,
         occurred_at: row.started_at, createMissing: false,
       });
       run(`INSERT INTO subscriptions (id, project_id, source_id, external_id, customer_ref, email, lead_id,

@@ -116,6 +116,31 @@ describe('the SDK in a real browser', { skip: pw ? false : 'playwright is not in
     await ctx.close();
   });
 
+  /**
+   * The visit that bounces is most of what an ad buys, and it is the one the flush
+   * timer never reaches: the only chance to report it is the beacon on the way out.
+   * That beacon goes cross-origin — the collector is never on the customer's domain —
+   * and a cross-origin beacon carrying application/json needs a CORS preflight it
+   * cannot make, so the browser drops it while sendBeacon still answers true. Nothing
+   * anywhere reports an error; the numbers simply come out flattering, because the
+   * visits that went nowhere are missing and the ones that converted are not.
+   */
+  test('a visitor who lands and leaves before any flush is still counted', async () => {
+    const ctx = await browser.newContext();
+    const page = await shopPage(ctx, { path: '/?utm_source=capterra&utm_campaign=bounced' });
+    await page.waitForFunction(() => window.runhq && window.runhq.firstTouch);
+    // Away well inside the 5s flush interval, onto a page that is not ours, so
+    // nothing here can replay a stored queue later and make this pass by accident.
+    await page.goto('about:blank');
+    await new Promise((r) => setTimeout(r, 800));
+
+    const { rows } = await leads();
+    const bounced = rows.find((l) => l.utm_campaign === 'bounced');
+    assert.ok(bounced, 'the landing was reported on the way out, not lost with the tab');
+    assert.equal(bounced.channel_name, 'Capterra');
+    await ctx.close();
+  });
+
   test('reset() forgets the visitor', async () => {
     const ctx = await browser.newContext();
     const page = await shopPage(ctx);

@@ -88,6 +88,22 @@ test('a charge becomes a payment with the payer, the money and the moment', () =
   assert.equal(row.occurred_at, new Date(1_700_000_000_000).toISOString());
 });
 
+test("a charge carries the product's own id for the payer when it was stamped on it", () => {
+  assert.equal(stripe.userRefFrom({ user_id: 'x:4417' }), 'x:4417');
+  assert.equal(stripe.userRefFrom({ run_user_id: 'x:1', user_id: 'x:2' }), 'x:1', 'the explicit key wins');
+  assert.equal(stripe.userRefFrom({ user: 99 }), '99', 'a number is still an id');
+  assert.equal(stripe.userRefFrom({ gold: '500' }), null, 'metadata that names no user is not one');
+  assert.equal(stripe.userRefFrom(null), null);
+
+  const row = stripe.normaliseCharge({
+    id: 'ch_m', status: 'succeeded', paid: true, amount: 499, currency: 'usd', created: 1_700_000_000,
+    metadata: { user: 'x:4417', gold: '500' },
+    billing_details: { email: null, name: null },
+  });
+  assert.equal(row.user_ref, 'x:4417');
+  assert.equal(row.customer_ref, null, 'a one-off Checkout session creates no Stripe customer');
+});
+
 test('a refund is a negative payment dated when the refund happened', () => {
   const row = stripe.normaliseRefund({
     id: 're_x', charge: 'ch_x', amount: 2000, currency: 'usd', created: 1_700_100_000, status: 'succeeded',
@@ -219,6 +235,54 @@ test('payments land on the channel that found the customer, refunds come back of
   const bob = get('SELECT * FROM leads WHERE project_id = :p AND email = :e', { p: project.id, e: 'bob@example.com' });
   assert.ok(bob, 'a customer nobody tracked still becomes a lead — an unattributed one');
   assert.equal(bob.channel_id, null);
+});
+
+test('a payment stamped with the product\'s user id reaches the lead that id identified', async () => {
+  // The shape of a social login: the product knows who this is and never learns an
+  // email, and the payer types whatever address they like into Stripe's card form.
+  const { project, google, source } = await connected({
+    charges: [charge('ch_u', 'card-holder@elsewhere.test', 49900, 5, { metadata: { user: 'x:4417', gold: '500' } })],
+    refunds: [], subscriptions: [],
+  });
+
+  ingestBatch({ key: project.sdk_key, anon_id: 'anon-x', events: [
+    { name: 'page', url: 'https://rooftop.test/?utm_source=google&gclid=abc', ts: atDay(9) },
+    { name: 'identify', user_id: 'x:4417', traits: { name: 'someone' }, ts: atDay(8) },
+  ] });
+
+  const result = await revenue.syncRevenueSource(source.id, { from: daysAgo(30), to: today() });
+  assert.equal(result.matched, 1);
+
+  const range = { from: daysAgo(30), to: today() };
+  const rows = analytics.channelBreakdown(project.id, range);
+  const byName = Object.fromEntries(rows.map((r) => [r.name, r]));
+  assert.equal(byName['Google Ads'].revenue, 499,
+    'the sale is credited to the ad that found them, not to Unattributed');
+  assert.equal(byName.Unattributed, undefined);
+
+  const lead = get('SELECT * FROM leads WHERE project_id = :p AND external_id = :x',
+    { p: project.id, x: 'x:4417' });
+  assert.equal(lead.stage, 'customer');
+  assert.equal(lead.first_channel_id, google.id);
+  assert.equal(all('SELECT id FROM leads WHERE project_id = :p', { p: project.id }).length, 1,
+    'and no second lead is invented for the address on the card');
+
+  const payment = get('SELECT * FROM payments WHERE external_id = :e', { e: 'ch_u' });
+  assert.equal(payment.user_ref, 'x:4417');
+  assert.equal(payment.lead_id, lead.id);
+});
+
+test('a stamped payment nobody tracked still becomes a lead, keyed by that id', async () => {
+  const { project, source } = await connected({
+    charges: [charge('ch_v', 'someone@elsewhere.test', 999, 4, { metadata: { user_id: 'g:7' } })],
+    refunds: [], subscriptions: [],
+  });
+  await revenue.syncRevenueSource(source.id, { from: daysAgo(30), to: today() });
+
+  const lead = get('SELECT * FROM leads WHERE project_id = :p AND external_id = :x', { p: project.id, x: 'g:7' });
+  assert.ok(lead, 'the id is what a later identify() from the product will meet this record on');
+  assert.equal(lead.email, 'someone@elsewhere.test', 'the address they paid with is kept too');
+  assert.equal(lead.channel_id, null);
 });
 
 test('re-syncing the same window does not count the same money again', async () => {
