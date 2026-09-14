@@ -110,6 +110,33 @@ export async function verifyAccount(key) {
 
 /* -------------------------------------------------------------- payments */
 
+/**
+ * Metadata keys a product may stamp its own user id onto a payment with.
+ *
+ * Stripe's customer id answers "who paid us" in Stripe's terms. It says nothing about
+ * who that is inside the product, and a Checkout session that creates no Customer has
+ * none at all — which is the normal shape of a one-off purchase. A product that writes
+ * its own user id onto the payment, the same id it passes to `runhq.identify()`, gives
+ * the two records a key that does not depend on the payer typing the address they
+ * signed up with. That is usually the only join that survives a social login, where the
+ * product never learns an email in the first place.
+ *
+ * Checkout writes metadata to whatever object it was set on: metadata on the *session*
+ * stays with the session, and only `payment_intent_data[metadata]` reaches the charge.
+ * The charge is what is read here, so that is the one to set.
+ */
+const USER_REF_KEYS = ['run_user_id', 'runhq_user_id', 'user_id', 'user', 'account_id'];
+
+export function userRefFrom(metadata) {
+  if (!metadata || typeof metadata !== 'object') return null;
+  for (const key of USER_REF_KEYS) {
+    const v = metadata[key];
+    if (typeof v === 'number' && Number.isFinite(v)) return String(v);
+    if (typeof v === 'string' && v.trim()) return v.trim().slice(0, 200);
+  }
+  return null;
+}
+
 export async function fetchCharges(key, { from, to }) {
   const charges = await listAll(key, '/charges', {
     'created[gte]': epochOf(from),
@@ -125,6 +152,7 @@ export function normaliseCharge(charge) {
     external_id: charge.id,
     kind: 'payment',
     customer_ref: customer?.id ?? (typeof charge.customer === 'string' ? charge.customer : null),
+    user_ref: userRefFrom(charge.metadata),
     email: charge.billing_details?.email || charge.receipt_email || customer?.email || null,
     name: charge.billing_details?.name || customer?.name || null,
     amount: fromMinor(charge.amount, charge.currency),
@@ -156,6 +184,7 @@ export function normaliseRefund(refund) {
     kind: 'refund',
     charge_ref: typeof refund.charge === 'string' ? refund.charge : refund.charge?.id ?? null,
     customer_ref: null,
+    user_ref: null,
     email: null,
     name: null,
     amount: -Math.abs(fromMinor(refund.amount, refund.currency)),
@@ -218,6 +247,7 @@ export function normaliseSubscription(sub) {
   return {
     external_id: sub.id,
     customer_ref: customer?.id ?? (typeof sub.customer === 'string' ? sub.customer : null),
+    user_ref: userRefFrom(sub.metadata),
     email: customer?.email ?? null,
     status: sub.status,
     plan: plans.join(' + ') || null,

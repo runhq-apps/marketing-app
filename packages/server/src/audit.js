@@ -302,7 +302,7 @@ function checkRevenueSources(project, totals, range) {
       out.push(f('revenue_unmatched', 'serious',
         `${pct}% of payments are not matched to a tracked lead`,
         `${money(Math.abs(paymentsInRange.unmatched_amount), cur)} was paid by people this app has no lead record for, so that money is credited to no channel. Payments are matched on the email the customer paid with — a checkout that collects a different address from the signup form breaks the join for everyone.`,
-        'Pass the same email to runhq.identify() that the customer pays with, or set the Stripe customer id as user_id so the two records meet on that instead.'));
+        'Pass the same email to runhq.identify() that the customer pays with, or stamp your own user id onto the payment (Stripe: payment_intent_data[metadata][user_id]) and pass that same id to runhq.identify() — a product whose sign-in never yields an email has no other join.'));
     }
   }
 

@@ -1,114 +1,136 @@
-import { test, before, after } from 'node:test';
+import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { useTempDb } from './helpers.js';
 
 useTempDb();
-process.env.PORT = '0';
-
-const { server } = await import('../src/index.js');
-const { provision, installSnippet } = await import('../scripts/provision.mjs');
-
-let host;
-before(async () => {
-  if (!server.listening) await new Promise((r) => server.once('listening', r));
-  host = `http://127.0.0.1:${server.address().port}`;
-});
-after(() => server.close());
+const { provision, loadSpec } = await import('../src/provision.js');
+const store = await import('../src/store.js');
+const { ingestBatch } = await import('../src/ingest.js');
+const { get } = await import('../src/db.js');
+const { matchLead } = await import('../src/revenue/index.js');
 
 const SPEC = {
-  project: { name: 'Arrr Fun', website: 'https://www.arrr.fun', currency: 'USD' },
+  project: { name: 'Spec Co', website: 'https://spec.test', currency: 'USD', target_cac: 40 },
   stages: [
-    { key: 'visit', label: 'Visit' },
-    { key: 'played', label: 'Played a match' },
+    { key: 'visit', label: 'Landed', is_conversion: false },
+    { key: 'lead', label: 'Signed up', is_conversion: false },
     { key: 'customer', label: 'Paid', is_conversion: true },
   ],
   channels: [
-    { provider: 'manual', name: 'Creator payouts', config: { match: { utm_medium: ['affiliate'] } } },
+    { provider: 'x_ads', name: 'X Ads', auth_type: 'manual', config: { match: { utm_source: ['x'] } } },
+    { provider: 'content_seo', name: 'Organic', auth_type: 'manual' },
   ],
 };
 
-test('a spec creates the project, its funnel and its channels', async () => {
-  const { project, changes, created } = await provision(SPEC, { host });
-  assert.equal(created, true);
-  assert.equal(project.slug, 'arrr-fun');
+test('a spec creates the project, its funnel and its channels', () => {
+  const plan = provision(SPEC);
+  assert.equal(plan.created, true);
+  assert.equal(plan.slug, 'spec-co');
+  assert.deepEqual(plan.stages, ['visit', 'lead', 'customer']);
+  assert.deepEqual(plan.channels.map((c) => c.created), [true, true]);
+
+  const project = store.getProject('spec-co');
+  assert.equal(project.website, 'https://spec.test');
+  assert.equal(project.target_cac, 40);
   assert.match(project.sdk_key, /^run_pk_/);
-  assert.deepEqual(project.stages.map((s) => s.key), ['visit', 'played', 'customer']);
-  assert.equal(project.stages.at(-1).is_conversion, 1);
-  assert.ok(changes.some((c) => c.includes('create project')));
-  assert.ok(changes.some((c) => c.includes('Creator payouts')));
 });
 
-test('re-running the same spec changes nothing and keeps the SDK key', async () => {
-  const first = await provision(SPEC, { host });
-  const again = await provision(SPEC, { host });
-  assert.deepEqual(again.changes, []);
-  assert.equal(again.created, false);
-  // The key is what is pasted into every site; a re-run that rotated it would
-  // silently stop collecting from all of them.
-  assert.equal(again.project.sdk_key, first.project.sdk_key);
+test('applying the same spec again changes nothing that is running', () => {
+  const before = store.getProject('spec-co');
+  const channel = store.listChannels(before.id).find((c) => c.provider === 'x_ads');
+  store.updateChannel(channel.id, { credentials: { token: 'secret-token' } });
+  store.upsertSpend(before.id, channel.id, [{ date: '2026-01-01', spend: 12.5 }], 'manual');
+
+  const plan = provision(SPEC);
+
+  assert.equal(plan.created, false);
+  assert.deepEqual(plan.channels.map((c) => c.created), [false, false],
+    'a channel already there is matched, not duplicated');
+  assert.equal(store.listChannels(before.id).length, 2);
+
+  const after = store.getProject('spec-co');
+  assert.equal(after.sdk_key, before.sdk_key, 'the key is the one already installed on the site');
+  assert.equal(after.id, before.id);
+
+  const reloaded = store.getChannel(channel.id);
+  assert.equal(store.channelCredentials(reloaded).token, 'secret-token', 'credentials are not the spec\'s business');
+  assert.equal(store.channelConfig(reloaded).match.utm_source[0], 'x');
+  assert.equal(get('SELECT COUNT(*) AS n FROM spend_daily WHERE channel_id = :c', { c: channel.id }).n, 1,
+    'and the spend recorded against it survives');
 });
 
-test('an edited spec is applied in place', async () => {
-  const edited = {
-    ...SPEC,
-    project: { ...SPEC.project, target_cac: 12 },
-    stages: [...SPEC.stages.slice(0, 2), { key: 'store', label: 'Opened checkout' }, SPEC.stages[2]],
-    channels: [...SPEC.channels, { provider: 'x_ads', name: 'X Ads' }],
-  };
-  const { project, changes } = await provision(edited, { host });
-  assert.equal(project.target_cac, 12);
-  assert.deepEqual(project.stages.map((s) => s.key), ['visit', 'played', 'store', 'customer']);
-  assert.ok(changes.some((c) => c.includes('funnel stages')));
-  assert.ok(changes.some((c) => c.includes('X Ads')));
+test('a re-applied funnel keeps the stage a lead had already reached', () => {
+  const project = store.getProject('spec-co');
+  ingestBatch({ key: project.sdk_key, anon_id: 'anon-1', events: [
+    { name: 'signup', traits: { email: 'someone@spec.test' } },
+  ] });
+  const before = get('SELECT * FROM leads WHERE project_id = :p', { p: project.id });
+  assert.equal(before.stage, 'lead');
 
-  const channels = await (await fetch(`${host}/api/projects/${project.id}/channels`)).json();
-  assert.equal(channels.length, 2);
+  provision(SPEC);
+
+  const after = get('SELECT * FROM leads WHERE id = :id', { id: before.id });
+  assert.equal(after.stage, 'lead');
+  assert.equal(store.projectStages(project.id).length, 3, 'the stages are replaced, not appended to');
 });
 
-test('a channel dropped from the spec is reported, never deleted', async () => {
-  const withoutXAds = {
-    ...SPEC,
-    project: { ...SPEC.project, target_cac: 12 },
-    stages: [...SPEC.stages.slice(0, 2), { key: 'store', label: 'Opened checkout' }, SPEC.stages[2]],
-  };
-  const { project, changes } = await provision(withoutXAds, { host });
-  assert.ok(changes.some((c) => c.includes('left alone') && c.includes('X Ads')));
+test('a spec is refused before anything is written when it cannot be applied', () => {
+  assert.throws(() => provision({ project: { name: 'Nope' }, channels: [{ provider: 'not_a_platform' }] }),
+    /unknown provider/);
+  assert.equal(store.getProject('nope'), null, 'and no half-made project is left behind');
 
-  const channels = await (await fetch(`${host}/api/projects/${project.id}/channels`)).json();
-  assert.equal(channels.length, 2, 'spend history survives a spec edit');
+  assert.throws(() => provision({
+    project: { name: 'Nope' },
+    stages: [{ key: 'visit', label: 'Landed' }],
+  }), /conversion/);
+  assert.throws(() => provision({ project: {} }), /project.name/);
 });
 
-test('a spec key the server will slugify does not re-post the funnel forever', async () => {
-  // The API slugifies stage keys on the way in, so `signed_in` is stored as `signed-in`.
-  // Comparing raw spec keys made a settled project look permanently out of date.
-  const spec = {
-    project: { name: 'Slug Keys' },
-    stages: [{ key: 'visit', label: 'Visit' }, { key: 'signed_in', label: 'Signed in' },
-      { key: 'customer', label: 'Paid', is_conversion: true }],
-  };
-  const first = await provision(spec, { host });
-  assert.deepEqual(first.project.stages.map((s) => s.key), ['visit', 'signed-in', 'customer']);
-  // The create call carries the stages, so no follow-up funnel write is needed at all.
-  assert.equal(first.changes.filter((c) => c.includes('funnel stages')).length, 0);
-
-  const again = await provision(spec, { host });
-  assert.deepEqual(again.changes, []);
+test('a dry run reports what it would do and touches nothing', () => {
+  const plan = provision({ ...SPEC, project: { ...SPEC.project, name: 'Dry Co' } }, { dryRun: true });
+  assert.equal(plan.created, true);
+  assert.deepEqual(plan.channels.map((c) => c.created), [true, true]);
+  assert.equal(store.getProject('dry-co'), null);
 });
 
-test('a dry run reports the work without doing it', async () => {
-  const spec = { project: { name: 'Nothing Doing' }, stages: SPEC.stages };
-  const { changes } = await provision(spec, { host, dryRun: true });
-  assert.ok(changes.some((c) => c.includes('create project nothing-doing')));
+test('the rooftop spec in this repo is one the provisioner accepts', async () => {
+  const spec = await loadSpec(new URL('../../../projects/rooftop.mjs', import.meta.url).pathname);
+  const plan = provision(spec, { dryRun: true });
 
-  const projects = await (await fetch(`${host}/api/projects`)).json();
-  assert.equal(projects.some((p) => p.slug === 'nothing-doing'), false);
+  assert.equal(plan.slug, 'rooftop');
+  assert.ok(spec.stages.some((s) => s.is_conversion), 'something has to count as a sale');
+  // The keys public/js/marketing.js in the rooftop checkout sends with runhq.stage().
+  assert.deepEqual(plan.stages, ['visit', 'verified', 'lead', 'player', 'customer']);
 });
 
-test('the printed snippet carries the real key and collector host', async () => {
-  const { project } = await provision(SPEC, { host: host });
-  const snippet = installSnippet(project, 'https://run.example.com/');
-  assert.equal(
-    snippet,
-    `<script async src="https://run.example.com/sdk.js" data-runhq-key="${project.sdk_key}"></script>`,
-  );
+test('the arrr.fun spec in this repo is one the provisioner accepts', async () => {
+  const spec = await loadSpec(new URL('../../../projects/arrr-fun.mjs', import.meta.url).pathname);
+  const plan = provision(spec, { dryRun: true });
+
+  assert.equal(plan.slug, 'arrr-fun');
+  assert.ok(spec.stages.some((s) => s.is_conversion), 'something has to count as a sale');
+  // The keys packages/client/src/run-marketing.ts sends with runhq.stage(); the game is
+  // a separate repo, so nothing but this list and that file's FUNNEL hold them together.
+  assert.deepEqual(plan.stages, ['visit', 'played', 'signed-in', 'engaged', 'store', 'customer']);
+});
+
+test('arrr.fun reaches its conversion stage on a payment alone, with no email', async () => {
+  // The game signs people in with X and never learns an email, so the only join between
+  // a Stripe charge and the lead that earned it is the account id the game stamps onto
+  // the payment. This is that path, end to end, on the real spec.
+  const spec = await loadSpec(new URL('../../../projects/arrr-fun.mjs', import.meta.url).pathname);
+  const project = provision(spec).project;
+
+  ingestBatch({ key: project.sdk_key, anon_id: 'anon-arrr', events: [
+    { name: 'page', url: 'https://www.arrr.fun/?utm_source=twitter&twclid=TW1' },
+    { name: 'identify', user_id: 'x:100', traits: { name: 'Alice' } },
+  ] });
+
+  const lead = get('SELECT * FROM leads WHERE project_id = :p AND external_id = :x',
+    { p: project.id, x: 'x:100' });
+  assert.equal(lead.email, null, 'the game never had one to give');
+  assert.equal(lead.utm_source, 'twitter');
+
+  const matched = matchLead(project, { user_ref: 'x:100', occurred_at: new Date().toISOString() });
+  assert.equal(matched.id, lead.id, 'the charge finds the ad that produced the player');
 });

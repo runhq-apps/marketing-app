@@ -150,6 +150,10 @@ CREATE TABLE IF NOT EXISTS payments (
   external_id      TEXT NOT NULL,
   kind             TEXT NOT NULL DEFAULT 'payment',
   customer_ref     TEXT,
+  -- The product's own id for whoever paid, when the payment carries one (Stripe charge
+  -- metadata). customer_ref is the processor's id for them; this is the id the product
+  -- passed to runhq.identify(), which is what leads are keyed by.
+  user_ref         TEXT,
   email            TEXT,
   name             TEXT,
   lead_id          TEXT REFERENCES leads(id) ON DELETE SET NULL,
@@ -238,11 +242,15 @@ db.exec(SCHEMA);
 // Bump this when SCHEMA changes in a way older files need patched in.
 const MIGRATIONS = [
   'ALTER TABLE events ADD COLUMN dedupe_key TEXT',
+  // The product's own id for whoever paid, when the payment carries one. Kept apart from
+  // customer_ref, which is the processor's id for them and answers a different question.
+  'ALTER TABLE payments ADD COLUMN user_ref TEXT',
 ];
 for (const m of MIGRATIONS) { try { db.exec(m); } catch { /* already applied */ } }
 
 // Indexes over migrated columns have to come after the migrations that add them.
 db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_events_dedupe ON events(dedupe_key)');
+db.exec('CREATE INDEX IF NOT EXISTS idx_payments_user ON payments(project_id, user_ref)');
 
 export const uid = () => randomUUID();
 export const now = () => new Date().toISOString();

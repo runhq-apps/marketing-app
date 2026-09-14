@@ -162,7 +162,15 @@ export function createClient(globalObj) {
     const body = JSON.stringify(payload(batch));
 
     if (useBeacon && win.navigator?.sendBeacon) {
-      const ok = win.navigator.sendBeacon(url, new Blob([body], { type: 'application/json' }));
+      // text/plain, not application/json, and the difference is the whole batch.
+      // application/json is not a CORS-safelisted content type, so a cross-origin
+      // beacon carrying it needs a preflight — and a beacon cannot make one. The
+      // browser drops it, sendBeacon still answers true, and the last events of every
+      // visit that ends on another origin's collector are lost without a sound. Those
+      // are disproportionately the short visits, which is most of the traffic an ad
+      // buys. The collector reads the bytes and parses them itself, so the label on
+      // them costs nothing.
+      const ok = win.navigator.sendBeacon(url, new Blob([body], { type: 'text/plain;charset=UTF-8' }));
       if (ok) return Promise.resolve({ sent: batch.length, transport: 'beacon' });
     }
     return win.fetch(url, {
