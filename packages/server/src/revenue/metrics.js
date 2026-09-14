@@ -56,7 +56,7 @@ export function revenueSummary(projectId, { from, to, attribution = 'last' } = {
      FROM payments WHERE project_id = :p AND substr(occurred_at, 1, 10) BETWEEN :from AND :to`, range);
 
   const payers = get(
-    `SELECT COUNT(DISTINCT COALESCE(lead_id, customer_ref, email)) AS n FROM payments
+    `SELECT COUNT(DISTINCT COALESCE(lead_id, user_ref, customer_ref, email)) AS n FROM payments
      WHERE project_id = :p AND kind = 'payment' AND amount > 0
        AND substr(occurred_at, 1, 10) BETWEEN :from AND :to`, range)?.n ?? 0;
 
@@ -64,7 +64,7 @@ export function revenueSummary(projectId, { from, to, attribution = 'last' } = {
   // period actually acquired, as opposed to the ones it merely billed again.
   const newPayers = get(
     `SELECT COUNT(*) AS n FROM (
-       SELECT COALESCE(lead_id, customer_ref, email) AS who, MIN(occurred_at) AS first_paid
+       SELECT COALESCE(lead_id, user_ref, customer_ref, email) AS who, MIN(occurred_at) AS first_paid
        FROM payments WHERE project_id = :p AND kind = 'payment' AND amount > 0
        GROUP BY who
      ) WHERE substr(first_paid, 1, 10) BETWEEN :from AND :to`, range)?.n ?? 0;
@@ -223,7 +223,7 @@ export function revenueByChannel(projectId, { attribution = 'last' } = {}) {
 export function topCustomers(projectId, { from, to, limit = 10, attribution = 'last' } = {}) {
   const col = attribution === 'first' ? 'first_channel_id' : 'channel_id';
   return all(
-    `SELECT COALESCE(p.lead_id, p.customer_ref, p.email) AS key,
+    `SELECT COALESCE(p.lead_id, p.user_ref, p.customer_ref, p.email) AS key,
             MAX(p.lead_id) AS lead_id,
             MAX(COALESCE(l.email, p.email)) AS email,
             MAX(COALESCE(l.name, p.name)) AS name,

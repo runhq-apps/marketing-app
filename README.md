@@ -33,6 +33,20 @@ npm start                     # http://localhost:4000
 It starts empty. Create a project, add the channels you actually spend on, and install the
 SDK — there is no demo data.
 
+A project can also be set up from a file instead of from the UI:
+
+```bash
+npm run provision projects/rooftop.mjs        # --dry to see what it would do first
+```
+
+A spec under `projects/` holds the project, its funnel and its channels, and applying it
+is idempotent: the project is matched by slug, stages are brought to what the spec says,
+and channels already there keep their credentials, their spend and their sync state.
+Nothing is ever deleted. A funnel is a claim about how a business acquires people and a
+channel's match rules are a claim about how its ad URLs are tagged — both are read by
+anyone trying to understand a number on the dashboard, so both are better in a file that
+can be reviewed and diffed than in a database on one machine.
+
 For development, `npm run dev` runs the API on :4000 and Vite on :5173 with a proxy.
 
 Requires Node 22.13+ (it uses the built-in `node:sqlite`). There is no database server to
@@ -144,12 +158,31 @@ request bytes with a timing-safe comparison and a five-minute replay window; any
 fails verification is rejected before the payload is parsed. The endpoint sits outside the
 admin-token gate, because Stripe cannot present a token — the signature is the auth.
 
-**Matching.** Payments join to leads on the email the customer paid with, then on the
-Stripe customer id if your product passes it to `runhq.identify()`. A payer who matches
-nothing still becomes a lead — an unattributed one — because a customer whose first touch
-was never tracked is a real hole in the attribution, and the honest place to show it is
-the Unattributed row rather than nowhere. The audit reports the share of revenue in that
-state.
+**Matching.** Payments join to leads in three attempts: your own user id if the payment
+carries one, then the email the customer paid with, then the Stripe customer id. A payer
+who matches nothing still becomes a lead — an unattributed one — because a customer whose
+first touch was never tracked is a real hole in the attribution, and the honest place to
+show it is the Unattributed row rather than nowhere. The audit reports the share of
+revenue in that state.
+
+The first of those is worth setting up. An email join assumes the address someone typed
+into a card form is the address they signed up with, which is often wrong and, for a
+product whose sign-in is social — an X or Google login, a wallet, a game handle — is
+usually not knowable at all: there is no email on either side to join on. Stamping your
+own user id onto the payment gives the two records a key that does not depend on it:
+
+```js
+// creating the Checkout session — metadata on the SESSION stays with the session,
+// so it goes on the payment intent, which is what becomes the charge
+'payment_intent_data[metadata][user_id]': user.id,
+```
+```js
+runhq.identify(user.id);   // the same id, from the product
+```
+
+Any of `run_user_id`, `runhq_user_id`, `user_id`, `user` or `account_id` is read off the
+charge's metadata. It is tried before the email, because the product asserting who paid
+is better evidence than what was typed at checkout.
 
 **Counting it once.** If the product already calls `runhq.revenue()`, remove those calls
 once Stripe is connected: the two describe the same money, and the audit raises
@@ -251,6 +284,7 @@ packages/
   server/   Node 22 + node:sqlite, no framework. Connectors, revenue, ingest, analytics, audit, HTTP API.
   sdk/      Dependency-free tracking SDK; builds to a script tag and an ES module.
   web/      React + Vite dashboard. Charts are hand-rolled SVG.
+projects/   One spec per project: its funnel and its channels, applied with `npm run provision`.
 ```
 
 ## Known limits
