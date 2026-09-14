@@ -198,6 +198,39 @@ the second half is the most common reason a dashboard like this reports nothing 
 Identities merge: an anonymous session that later identifies as an existing person is
 folded into that person's record, events included, with the earlier first touch kept.
 
+## Provisioning a project from a file
+
+Clicking a project together in the UI is fine once. It is not a good *record* of how one
+is set up: nobody can review it, nothing reproduces it on a second install, and a
+channel's UTM rules — the thing attribution actually turns on — end up known only to
+whoever typed them. So a project can also be declared:
+
+```bash
+npm run provision projects/arrr-fun.json          # against http://localhost:4000
+npm run provision -- projects/arrr-fun.json --host https://run.example.com --dry-run
+```
+
+```json
+{
+  "project": { "name": "arrr.fun", "website": "https://www.arrr.fun", "currency": "USD" },
+  "stages":  [{ "key": "visit", "label": "Visit" },
+              { "key": "customer", "label": "Paid", "is_conversion": true }],
+  "channels": [{ "provider": "manual", "name": "Creator payouts",
+                 "config": { "match": { "utm_medium": ["affiliate"] } } }]
+}
+```
+
+It talks to the HTTP API, not the database, so the same command provisions a local install
+and a deployed one. **Re-running is the point**: the project is matched by slug and
+reconciled in place, so a spec edit is applied by running it again, and the SDK key never
+rotates underneath the sites that carry it. It never deletes — a channel dropped from the
+spec is reported and left alone, because removing one takes its spend history with it.
+
+`projects/` holds the specs that are live. `projects/arrr-fun.json` is the arrr.fun game
+platform (`www.arrr.fun`, `play.arrr.fun`), whose funnel runs
+visit → played a match → signed in → engaged → opened checkout → paid, with revenue read
+from Stripe rather than reported by the game.
+
 ## The audit
 
 Re-runnable from the Audit tab; it re-fetches your site each time. It checks:
@@ -251,6 +284,7 @@ packages/
   server/   Node 22 + node:sqlite, no framework. Connectors, revenue, ingest, analytics, audit, HTTP API.
   sdk/      Dependency-free tracking SDK; builds to a script tag and an ES module.
   web/      React + Vite dashboard. Charts are hand-rolled SVG.
+projects/   Declarative project specs — see "Provisioning a project from a file".
 ```
 
 ## Known limits
