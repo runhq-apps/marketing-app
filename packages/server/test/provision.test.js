@@ -118,19 +118,31 @@ test('arrr.fun reaches its conversion stage on a payment alone, with no email', 
   // The game signs people in with X and never learns an email, so the only join between
   // a Stripe charge and the lead that earned it is the account id the game stamps onto
   // the payment. This is that path, end to end, on the real spec.
+  //
+  // Nothing below is awaited because nothing below is asynchronous: the store is
+  // node:sqlite's DatabaseSync, so ingestBatch() has committed its transaction by the
+  // time it returns and matchLead() answers with a row rather than a promise of one.
+  // The whole server is written on that property. `async` here is for loadSpec alone.
   const spec = await loadSpec(new URL('../../../projects/arrr-fun.mjs', import.meta.url).pathname);
   const project = provision(spec).project;
 
-  ingestBatch({ key: project.sdk_key, anon_id: 'anon-arrr', events: [
+  // Asserting on the ingest's own report, rather than discarding it, is what pins that:
+  // a batch that had not been applied yet could not say how many events it accepted.
+  const ingested = ingestBatch({ key: project.sdk_key, anon_id: 'anon-arrr', events: [
     { name: 'page', url: 'https://www.arrr.fun/?utm_source=twitter&twclid=TW1' },
     { name: 'identify', user_id: 'x:100', traits: { name: 'Alice' } },
   ] });
+  assert.equal(ingested.accepted, 2);
 
   const lead = get('SELECT * FROM leads WHERE project_id = :p AND external_id = :x',
     { p: project.id, x: 'x:100' });
+  // Before comparing anything to it: an assertion between two absent values is one that
+  // holds whatever the code does, and this test exists to say the join WORKS.
+  assert.ok(lead, 'the identify() landed and is readable straight away');
   assert.equal(lead.email, null, 'the game never had one to give');
   assert.equal(lead.utm_source, 'twitter');
 
   const matched = matchLead(project, { user_ref: 'x:100', occurred_at: new Date().toISOString() });
-  assert.equal(matched.id, lead.id, 'the charge finds the ad that produced the player');
+  assert.ok(matched, 'a charge carrying only the account id still finds somebody');
+  assert.equal(matched.id, lead.id, 'and it is the lead that carries the ad');
 });
