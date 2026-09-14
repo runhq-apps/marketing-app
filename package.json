@@ -10,7 +10,8 @@
     "dev": "npm run build -w @runhq/sdk && concurrently -n api,web -c blue,magenta \"npm run dev -w @runhq/server\" \"npm run dev -w @runhq/web\"",
     "build": "npm run build -w @runhq/sdk && npm run build -w @runhq/web",
     "start": "npm run start -w @runhq/server",
-    "test": "npm test -w @runhq/server"
+    "test": "npm test -w @runhq/server",
+    "provision": "node packages/server/scripts/provision.mjs"
   },
   "devDependencies": {
     "concurrently": "^9.1.2",
